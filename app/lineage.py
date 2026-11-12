@@ -15,6 +15,24 @@ from sqlglot.errors import ParseError, TokenError
 
 DIALECT = "duckdb"
 
+# A rendered identifier part stays as-is unless it contains a dot (a path
+# separator) or a double quote. Those are the ambiguous cases, and DuckDB
+# renders them double-quoted, escaping embedded double quotes by doubling them.
+def _quote_identifier(name: str) -> str:
+    """Render one identifier part using DuckDB double-quote rules."""
+    if "." not in name and '"' not in name:
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _render_path(parts: tuple[str, ...]) -> str:
+    """Render a reference path, quoting parts that contain dots/quotes."""
+    return ".".join(_quote_identifier(part) for part in parts)
+
+
+def _scope_key(parts: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_norm(part) for part in parts)
+
 
 class AnalysisError(Exception):
     """A single analysis problem (unsupported SQL or unresolvable reference)."""
@@ -31,9 +49,14 @@ class AnalysisError(Exception):
 
 @dataclass
 class ColumnNode:
-    """One output column of one scope (a model or a CTE)."""
+    """One output column of one scope (a model or a CTE).
 
-    scope_id: str
+    ``scope_path`` is a tuple of identifier parts (model name, then CTE names),
+    never a joined string, so a model named ``carrier.postcode`` and a CTE
+    ``postcode`` inside model ``carrier`` stay distinct scopes.
+    """
+
+    scope_path: tuple[str, ...]
     output_name: str
     expression_sql: str
     parents: list["ColumnNode"] = field(default_factory=list)
@@ -41,21 +64,23 @@ class ColumnNode:
     source_table: Optional[str] = None
     source_column: Optional[str] = None
 
+    @property
+    def scope_id(self) -> str:
+        return _render_path(self.scope_path)
+
     def label(self) -> str:
         if self.is_source:
-            return f"{self.source_table}.{self.source_column}"
-        return f"{self.scope_id}.{self.output_name}"
+            return f"{_quote_identifier(self.source_table)}" \
+                   f".{_quote_identifier(self.source_column)}"
+        return f"{self.scope_id}.{_quote_identifier(self.output_name)}"
 
     def chains_to(self, targets: set[tuple[str, str]]) -> list[list[str]]:
         """All simple reference paths from this node down to target source columns."""
-        target_tables = {t[0] for t in targets}
-        target_columns = {t[1] for t in targets}
         found: list[list[str]] = []
 
         def walk(node: ColumnNode, seen: set[int]) -> list[list[str]]:
             if node.is_source:
-                if _norm(node.source_table) in target_tables and \
-                        _norm(node.source_column) in target_columns:
+                if (_norm(node.source_table), _norm(node.source_column)) in targets:
                     return [[node.label()]]
                 return []
             paths: list[list[str]] = []
@@ -96,8 +121,8 @@ class Analyzer:
         }
         self.models = models
         self.targets = [(t.lower(), c.lower()) for t, c in targets]
-        # scope_id -> {lower output name -> ColumnNode}
-        self.scopes: dict[str, dict[str, ColumnNode]] = {}
+        # scope key (lower-cased path parts) -> {lower output name -> ColumnNode}
+        self.scopes: dict[tuple[str, ...], dict[str, ColumnNode]] = {}
         # cached source-column nodes so repeated table references share nodes
         self._source_nodes: dict[str, dict[str, ColumnNode]] = {}
         self.errors: list[AnalysisError] = []
@@ -207,9 +232,9 @@ class Analyzer:
         return ordered
 
     # ------------------------------------------------------------- scope helpers
-    def _register_scope(self, scope_id: str) -> dict[str, ColumnNode]:
+    def _register_scope(self, scope_path: tuple[str, ...]) -> dict[str, ColumnNode]:
         columns: dict[str, ColumnNode] = {}
-        self.scopes[scope_id] = columns
+        self.scopes[_scope_key(scope_path)] = columns
         return columns
 
     def _source_relation(self, table: exp.Table, model: str) -> Relation:
@@ -227,7 +252,7 @@ class Analyzer:
         else:
             cols = {
                 _norm(original): ColumnNode(
-                    scope_id=tname,
+                    scope_path=(tname,),
                     output_name=original,
                     expression_sql=original,
                     is_source=True,
@@ -241,7 +266,7 @@ class Analyzer:
         return Relation(binding=binding, display=table.sql(DIALECT), columns=cols)
 
     def _model_relation(self, table: exp.Table, model_name: str, model: str) -> Relation:
-        scope = self.scopes.get(_norm(model_name))
+        scope = self.scopes.get(_scope_key((model_name,)))
         if scope is None:
             raise AnalysisError(
                 f"模型 {model_name} 尚未分析（依赖顺序异常）", model=model)
@@ -250,8 +275,8 @@ class Analyzer:
         return Relation(binding=binding, display=table.sql(DIALECT),
                         columns=dict(scope))
 
-    def _build_relations(self, scope_id: str, select: exp.Select,
-                         cte_scopes: dict[str, tuple[str, dict[str, ColumnNode]]],
+    def _build_relations(self, scope_path: tuple[str, ...], select: exp.Select,
+                         cte_scopes: dict[str, tuple[tuple[str, ...], dict[str, ColumnNode]]],
                          model: str) -> list[Relation]:
         relations: list[Relation] = []
         bindings: set[str] = set()
@@ -269,7 +294,7 @@ class Analyzer:
                     f"CTE {table.name} 被重复引用且未提供别名，无法消歧",
                     model=model, location=table.sql(DIALECT))
             if tkey in cte_scopes:
-                cte_scope_id, scope = cte_scopes[tkey]
+                _cte_scope_path, scope = cte_scopes[tkey]
                 # share the CTE output nodes themselves
                 relation = Relation(binding=binding, display=table.sql(DIALECT),
                                     columns=dict(scope))
@@ -348,7 +373,7 @@ class Analyzer:
 
     def _expand_star(self, star: exp.Expression, relations: list[Relation],
                      output: dict[str, ColumnNode], ordered_names: list[str],
-                     scope_id: str, model: str) -> None:
+                     scope_path: tuple[str, ...], model: str) -> None:
         spec = self._star_spec(star)
         excludes = {_norm(e.name if isinstance(e, exp.Column) else e.name)
                     for e in (spec.args.get("except_") or [])}
@@ -380,11 +405,11 @@ class Analyzer:
                     parents = self._resolve_expression(expr, relations, model)
                     alias = replace_match.alias or name
                     node = ColumnNode(
-                        scope_id=scope_id, output_name=alias,
+                        scope_path=scope_path, output_name=alias,
                         expression_sql=expr.sql(DIALECT), parents=parents)
                 else:
                     node = ColumnNode(
-                        scope_id=scope_id, output_name=name,
+                        scope_path=scope_path, output_name=name,
                         expression_sql=source_node.expression_sql,
                         parents=[source_node])
                 output[_norm(node.output_name)] = node
@@ -392,7 +417,7 @@ class Analyzer:
 
     # --------------------------------------------------------------- conditions
     def _record_condition(self, kind: str, expression: exp.Expression,
-                          relations: list[Relation], scope_id: str,
+                          relations: list[Relation], scope_path: tuple[str, ...],
                           model: str, sink: list[dict]) -> None:
         for column in expression.find_all(exp.Column):
             node = self._resolve_column(column, relations, model)
@@ -400,35 +425,35 @@ class Analyzer:
             for chain in chains:
                 sink.append({
                     "type": kind,
-                    "scope": scope_id,
+                    "scope": _render_path(scope_path),
                     "expression": expression.sql(DIALECT),
                     "column": column.sql(DIALECT),
                     "reference_chain": chain,
                 })
 
     # ----------------------------------------------------------------- one select
-    def analyze_select(self, select: exp.Select, scope_id: str,
-                       cte_scopes: dict[str, tuple[str, dict[str, ColumnNode]]],
+    def analyze_select(self, select: exp.Select, scope_path: tuple[str, ...],
+                       cte_scopes: dict[str, tuple[tuple[str, ...], dict[str, ColumnNode]]],
                        model: str, condition_sink: list[dict]) -> dict[str, ColumnNode]:
         # CTEs first (non-recursive, lexical, can reference earlier CTEs)
         local_cte = dict(cte_scopes)
         for cte in select.ctes:
-            cte_id = f"{scope_id}.{cte.alias}"
-            cte_cols = self._register_scope(cte_id)
+            cte_path = (*scope_path, cte.alias)
+            cte_cols = self._register_scope(cte_path)
             cte_output = self.analyze_select(
-                cte.this, cte_id, local_cte, model, condition_sink)
+                cte.this, cte_path, local_cte, model, condition_sink)
             cte_cols.update(cte_output)
-            local_cte[_norm(cte.alias)] = (cte_id, cte_cols)
+            local_cte[_norm(cte.alias)] = (cte_path, cte_cols)
 
-        relations = self._build_relations(scope_id, select, local_cte, model)
-        output = self._register_scope(scope_id)
+        relations = self._build_relations(scope_path, select, local_cte, model)
+        output = self._register_scope(scope_path)
         ordered_names: list[str] = []
 
         for projection in select.expressions:
             if isinstance(projection, exp.Star) or (
                 isinstance(projection, exp.Column) and projection.is_star):
                 self._expand_star(projection, relations, output, ordered_names,
-                                  scope_id, model)
+                                  scope_path, model)
                 continue
             if isinstance(projection, exp.Alias):
                 expr = projection.this
@@ -445,7 +470,7 @@ class Analyzer:
                     model=model, location=projection.sql(DIALECT)[:60])
             parents = self._resolve_expression(expr, relations, model)
             node = ColumnNode(
-                scope_id=scope_id, output_name=out_name,
+                scope_path=scope_path, output_name=out_name,
                 expression_sql=expr.sql(DIALECT), parents=parents)
             output[_norm(out_name)] = node
             ordered_names.append(out_name)
@@ -453,12 +478,12 @@ class Analyzer:
         where = select.args.get("where")
         if where is not None:
             self._record_condition(
-                "WHERE", where.this, relations, scope_id, model, condition_sink)
+                "WHERE", where.this, relations, scope_path, model, condition_sink)
         for join in select.args.get("joins") or []:
             on = join.args.get("on")
             if on is not None:
                 self._record_condition(
-                    "JOIN ON", on, relations, scope_id, model, condition_sink)
+                    "JOIN ON", on, relations, scope_path, model, condition_sink)
             for ident in join.args.get("using") or []:
                 # USING(col) equates col on both sides of the join; record each
                 # side that actually exposes it.
@@ -470,15 +495,16 @@ class Analyzer:
                     for chain in node.chains_to(set(self.targets)):
                         condition_sink.append({
                             "type": "JOIN USING",
-                            "scope": scope_id,
+                            "scope": _render_path(scope_path),
                             "expression": join.sql(DIALECT),
-                            "column": f"{relation.display}.{col_name}",
+                            "column": f"{relation.display}."
+                                      f"{_quote_identifier(col_name)}",
                             "reference_chain": chain,
                         })
         qualify = select.args.get("qualify")
         if qualify is not None:
             self._record_condition(
-                "QUALIFY", qualify.this, relations, scope_id, model, condition_sink)
+                "QUALIFY", qualify.this, relations, scope_path, model, condition_sink)
         return output
 
     # ---------------------------------------------------------------------- run
@@ -497,7 +523,7 @@ class Analyzer:
             conditions: list[dict] = []
             try:
                 output = self.analyze_select(
-                    parsed[model_name], model_name, {}, model_name, conditions)
+                    parsed[model_name], (model_name,), {}, model_name, conditions)
             except AnalysisError as exc:
                 if exc.model is None:
                     exc.model = model_name

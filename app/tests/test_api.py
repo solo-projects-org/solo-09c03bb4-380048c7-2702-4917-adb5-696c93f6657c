@@ -94,7 +94,60 @@ def test_unknown_target_returns_400():
 
 def test_swagger_examples_present():
     schema = client.get("/openapi.json").json()
-    example = (schema["components"]["schemas"]["AnalyzeRequest"]
-               ["examples"][0])
-    assert example["targets"][0]["column"] == "receiver_zip_old"
+    examples = (schema["components"]["schemas"]["AnalyzeRequest"]["examples"])
+    assert examples[0]["targets"][0]["column"] == "receiver_zip_old"
+    # the collision sample ships first so Try-it-out shows the dotted-name case
+    assert {"carrier.postcode", "carrier"} <= {
+        m["name"] for m in examples[0]["models"]}
     assert "/analyze" in schema["paths"]
+
+
+def test_swagger_request_body_examples_are_submittable():
+    schema = client.get("/openapi.json").json()
+    media = schema["paths"]["/analyze"]["post"]["requestBody"]["content"][
+        "application/json"]
+    body_examples = media["examples"]
+    assert "dotted_scope_collision" in body_examples
+    # every Swagger sample must actually analyze successfully via Try-it-out
+    for name, example in body_examples.items():
+        resp = client.post("/analyze", json=example["value"])
+        assert resp.status_code == 200, (name, resp.text)
+
+
+def test_dot_collision_example_end_to_end():
+    from app.main import QUOTED_SCOPE_COLLISION_EXAMPLE
+
+    resp = client.post("/analyze", json=QUOTED_SCOPE_COLLISION_EXAMPLE)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["models"]
+    # model name "carrier.postcode" is quoted as one identifier
+    assert body["carrier.postcode"]["dependent_output_columns"] == [{
+        "output_column": "postcode_zip",
+        "reference_chains": [[
+            '"carrier.postcode".postcode_zip', "waybills.receiver_zip_old"]],
+    }]
+    # CTE scope carrier.postcode belongs to model carrier, unquoted
+    assert body["carrier"]["dependent_output_columns"] == [{
+        "output_column": "zip",
+        "reference_chains": [[
+            "carrier.zip", "carrier.postcode.zip", "waybills.receiver_zip_old"]],
+    }]
+    assert body["carrier"]["filter_conditions"][0]["scope"] == "carrier.postcode"
+    # the downstream model keeps both distinct paths
+    fact = body["dwd_delivery_fact"]["dependent_output_columns"]
+    chains = {tuple(c) for entry in fact for c in entry["reference_chains"]}
+    assert (
+        "dwd_delivery_fact.carrier_zip", "carrier.zip", "carrier.postcode.zip",
+        "waybills.receiver_zip_old") in chains
+    assert (
+        "dwd_delivery_fact.postcode_zip", '"carrier.postcode".postcode_zip',
+        "waybills.receiver_zip_old") in chains
+
+
+def test_plain_names_response_structure_unchanged():
+    resp = client.post("/analyze", json=SAMPLE)
+    assert resp.status_code == 200
+    assert resp.json()["models"]["stg_waybill"]["dependent_output_columns"][0][
+        "reference_chains"][0] == [
+        "stg_waybill.zip", "stg_waybill.cleaned.zip",
+        "waybills.receiver_zip_old"]

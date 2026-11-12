@@ -1,0 +1,25 @@
+{
+  "sources": [
+    {
+      "name": "waybills",
+      "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg"]
+    }
+  ],
+  "models": [
+    {
+      "name": "carrier.postcode",
+      "sql": "SELECT waybill_id,\n       receiver_zip_old AS postcode_zip,\n       city_id\nFROM waybills"
+    },
+    {
+      "name": "carrier",
+      "sql": "WITH postcode AS (\n  SELECT waybill_id,\n         receiver_zip_old AS zip\n  FROM waybills\n  WHERE receiver_zip_old IS NOT NULL\n)\nSELECT waybill_id, zip\nFROM postcode"
+    },
+    {
+      "name": "dwd_delivery_fact",
+      "sql": "SELECT c.zip AS carrier_zip,\n       p.postcode_zip\nFROM carrier c\nJOIN \"carrier.postcode\" p ON c.waybill_id = p.waybill_id\nWHERE c.zip IS NOT NULL"
+    }
+  ],
+  "targets": [
+    { "table": "waybills", "column": "receiver_zip_old" }
+  ]
+}

@@ -8,14 +8,104 @@ from pydantic import BaseModel, Field
 
 from .lineage import AggregatedAnalysisError, AnalysisError, Analyzer
 
+ZIP_RENAME_EXAMPLE = {
+    "sources": [
+        {
+            "name": "waybills",
+            "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg"],
+        },
+        {
+            "name": "dim_delivery_zone",
+            "columns": ["zone_id", "zip_code", "zone_name"],
+        },
+    ],
+    "models": [
+        {
+            "name": "stg_waybill",
+            "sql": (
+                "WITH cleaned AS (\n"
+                "  SELECT waybill_id, receiver_zip_old AS zip, city_id, weight_kg\n"
+                "  FROM waybills\n"
+                "  WHERE receiver_zip_old IS NOT NULL\n"
+                ")\n"
+                "SELECT waybill_id, zip, city_id, weight_kg\n"
+                "FROM cleaned"
+            ),
+        },
+        {
+            "name": "dwd_delivery_fact",
+            "sql": (
+                "SELECT s.waybill_id,\n"
+                "       s.zip AS receiver_zip,\n"
+                "       z.zone_name,\n"
+                "       s.weight_kg * 1000 AS weight_g\n"
+                "FROM stg_waybill s\n"
+                "JOIN dim_delivery_zone z ON s.zip = z.zip_code\n"
+                "WHERE s.zip LIKE '10%'"
+            ),
+        },
+    ],
+    "targets": [{"table": "waybills", "column": "receiver_zip_old"}],
+}
+
+# Model name "carrier.postcode" and the CTE path carrier.postcode collide when
+# scopes are naively joined with dots. The quoted model name and the CTE must
+# stay separate: "carrier.postcode" is one quoted identifier, while
+# carrier.postcode is model carrier + CTE postcode.
+QUOTED_SCOPE_COLLISION_EXAMPLE = {
+    "sources": [
+        {
+            "name": "waybills",
+            "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg"],
+        },
+    ],
+    "models": [
+        {
+            "name": "carrier.postcode",
+            "sql": (
+                "SELECT waybill_id,\n"
+                "       receiver_zip_old AS postcode_zip,\n"
+                "       city_id\n"
+                "FROM waybills"
+            ),
+        },
+        {
+            "name": "carrier",
+            "sql": (
+                "WITH postcode AS (\n"
+                "  SELECT waybill_id,\n"
+                "         receiver_zip_old AS zip\n"
+                "  FROM waybills\n"
+                "  WHERE receiver_zip_old IS NOT NULL\n"
+                ")\n"
+                "SELECT waybill_id, zip\n"
+                "FROM postcode"
+            ),
+        },
+        {
+            "name": "dwd_delivery_fact",
+            "sql": (
+                "SELECT c.zip AS carrier_zip,\n"
+                "       p.postcode_zip\n"
+                "FROM carrier c\n"
+                'JOIN "carrier.postcode" p ON c.waybill_id = p.waybill_id\n'
+                "WHERE c.zip IS NOT NULL"
+            ),
+        },
+    ],
+    "targets": [{"table": "waybills", "column": "receiver_zip_old"}],
+}
+
 app = FastAPI(
     title="配送数仓列依赖分析服务",
     description=(
         "基于 SQLGlot 解析（不执行 SQL），沿别名、普通星号与非递归 CTE 跨模型追踪"
         "待下线源列的引用，按模型输出依赖该列的输出列以及 WHERE / JOIN ON 条件，"
         "每项附引用链。不支持聚合、集合运算与 CTE 之外的子查询。"
+        "名称中的点按 DuckDB 规则处理：引号内的点是名称的一部分，"
+        "引号外的点是引用链/作用域分隔符。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -44,49 +134,12 @@ class AnalyzeRequest(BaseModel):
         "populate_by_name": True,
         "json_schema_extra": {
             "examples": [
-                {
-                    "sources": [
-                        {
-                            "name": "waybills",
-                            "columns": [
-                                "waybill_id", "receiver_zip_old", "city_id", "weight_kg",
-                            ],
-                        },
-                        {
-                            "name": "dim_delivery_zone",
-                            "columns": ["zone_id", "zip_code", "zone_name"],
-                        },
-                    ],
-                    "models": [
-                        {
-                            "name": "stg_waybill",
-                            "sql": (
-                                "WITH cleaned AS (\n"
-                                "  SELECT waybill_id, receiver_zip_old AS zip, city_id\n"
-                                "  FROM waybills\n"
-                                "  WHERE receiver_zip_old IS NOT NULL\n"
-                                ")\n"
-                                "SELECT waybill_id, zip, city_id\n"
-                                "FROM cleaned"
-                            ),
-                        },
-                        {
-                            "name": "dwd_delivery_fact",
-                            "sql": (
-                                "SELECT s.waybill_id,\n"
-                                "       s.zip AS receiver_zip,\n"
-                                "       z.zone_name,\n"
-                                "       s.weight_kg * 1000 AS weight_g\n"
-                                "FROM stg_waybill s\n"
-                                "JOIN dim_delivery_zone z ON s.zip = z.zip_code\n"
-                                "WHERE s.zip LIKE '10%'"
-                            ),
-                        },
-                    ],
-                    "targets": [
-                        {"table": "waybills", "column": "receiver_zip_old"}
-                    ],
-                }
+                dict(QUOTED_SCOPE_COLLISION_EXAMPLE, **{
+                    "summary": "模型名与 CTE 路径含点相撞：按 DuckDB 引号规则区分",
+                }),
+                dict(ZIP_RENAME_EXAMPLE, **{
+                    "summary": "邮编改名：跨模型与 CTE 的普通名称",
+                }),
             ]
         },
     }
@@ -131,6 +184,24 @@ class ErrorResponse(BaseModel):
     response_model=AnalyzeResponse,
     responses={400: {"model": ErrorResponse, "description": "解析、引用或不支持构造错误"}},
     summary="分析待下线源列在各模型中的依赖",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "dotted_scope_collision": {
+                            "summary": "模型名与 CTE 路径含点相撞：按 DuckDB 引号规则区分",
+                            "value": QUOTED_SCOPE_COLLISION_EXAMPLE,
+                        },
+                        "zip_rename": {
+                            "summary": "邮编改名：跨模型与 CTE 的普通名称",
+                            "value": ZIP_RENAME_EXAMPLE,
+                        },
+                    }
+                }
+            }
+        }
+    },
 )
 def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
     source_names = [s.name for s in request.sources]

@@ -328,3 +328,215 @@ def test_duplicate_output_name_rejected():
     with pytest.raises(AggregatedAnalysisError) as exc:
         analyze({"m": "SELECT receiver_zip_old, receiver_zip_old FROM waybills"})
     assert "重复" in str(exc.value)
+
+
+# ------------------------------------------------- quoted names containing dots
+COLLISION_MODELS = {
+    # Model whose *name* is one quoted identifier containing a dot.
+    "carrier.postcode": (
+        "SELECT waybill_id, receiver_zip_old AS zip, city_id FROM waybills"
+        " WHERE receiver_zip_old IS NOT NULL"
+    ),
+    # Model "carrier" whose CTE path is carrier.postcode -- the colliding scope.
+    "carrier": (
+        "WITH postcode AS ("
+        " SELECT w.waybill_id, w.receiver_zip_old AS cte_zip"
+        " FROM waybills w"
+        " WHERE w.receiver_zip_old IS NOT NULL"
+        ") SELECT waybill_id, cte_zip FROM postcode"
+    ),
+    "dwd_delivery_fact": (
+        'SELECT c.cte_zip AS carrier_zip, p.zip AS postcode_zip'
+        ' FROM carrier c'
+        ' JOIN "carrier.postcode" p ON c.waybill_id = p.waybill_id'
+        " WHERE c.cte_zip IS NOT NULL"
+    ),
+}
+
+
+def test_dotted_model_name_and_cte_path_do_not_share_scope():
+    result = analyze(COLLISION_MODELS)
+    # the model and the CTE each keep their own output columns
+    assert chain_sets(result, "carrier.postcode", "zip") == {
+        ('"carrier.postcode".zip', "waybills.receiver_zip_old"),
+    }
+    assert chain_sets(result, "carrier", "cte_zip") == {
+        ("carrier.cte_zip", "carrier.postcode.cte_zip",
+         "waybills.receiver_zip_old"),
+    }
+    # and downstream output columns trace to the source through their own path
+    assert chain_sets(result, "dwd_delivery_fact", "carrier_zip") == {
+        ("dwd_delivery_fact.carrier_zip", "carrier.cte_zip",
+         "carrier.postcode.cte_zip", "waybills.receiver_zip_old"),
+    }
+    assert chain_sets(result, "dwd_delivery_fact", "postcode_zip") == {
+        ("dwd_delivery_fact.postcode_zip", '"carrier.postcode".zip',
+         "waybills.receiver_zip_old"),
+    }
+    # the model's output is not mixed into the CTE scope or vice versa
+    assert {e["output_column"] for e in
+            result["carrier"]["dependent_output_columns"]} == {"cte_zip"}
+    assert {e["output_column"] for e in
+            result["carrier.postcode"]["dependent_output_columns"]} == {"zip"}
+
+
+def test_colliding_scopes_report_conditions_separately():
+    result = analyze(COLLISION_MODELS)
+    scopes = {c["scope"] for c in result["carrier.postcode"]["filter_conditions"]}
+    assert scopes == {'"carrier.postcode"'}
+    cte_scopes = {c["scope"] for c in result["carrier"]["filter_conditions"]}
+    assert cte_scopes == {"carrier.postcode"}
+    # the dotted model's condition still reaches the source column
+    assert result["carrier.postcode"]["filter_conditions"][0]["reference_chain"] == [
+        "waybills.receiver_zip_old"]
+
+
+def test_quoted_dot_name_not_confused_with_path_separator():
+    result = analyze({
+        # Model whose whole name is one dotted identifier.
+        "carrier.postcode": (
+            "SELECT waybill_id, receiver_zip_old AS model_zip FROM waybills"
+        ),
+        "carrier": (
+            "WITH postcode AS ("
+            " SELECT waybill_id, receiver_zip_old AS cte_zip FROM waybills"
+            ") SELECT waybill_id, cte_zip FROM postcode"
+        ),
+        # Quoted name reaches the model; the bare CTE reaches only the CTE.
+        "mix": (
+            'SELECT p.model_zip AS from_model, c.cte_zip AS from_cte'
+            ' FROM "carrier.postcode" p'
+            " JOIN carrier c ON p.waybill_id = c.waybill_id"
+        ),
+    })
+    assert chain_sets(result, "mix", "from_model") == {
+        ("mix.from_model", '"carrier.postcode".model_zip',
+         "waybills.receiver_zip_old"),
+    }
+    assert chain_sets(result, "mix", "from_cte") == {
+        ("mix.from_cte", "carrier.cte_zip", "carrier.postcode.cte_zip",
+         "waybills.receiver_zip_old"),
+    }
+
+
+def test_unquoted_dotted_table_is_path_not_dotted_model_name():
+    # carrier.postcode in FROM position is schema "carrier", table "postcode";
+    # it must not silently resolve to the model named "carrier.postcode".
+    with pytest.raises(AggregatedAnalysisError) as exc:
+        analyze({
+            "carrier.postcode": "SELECT receiver_zip_old AS zip FROM waybills",
+            "m": "SELECT zip FROM carrier.postcode",
+        })
+    assert "找不到表或 CTE postcode" in str(exc.value)
+
+
+def test_nested_dotted_cte_names_are_quoted_in_chains_and_scopes():
+    result = analyze({
+        "m": (
+            'WITH "raw.waybill" AS ('
+            ' SELECT receiver_zip_old AS "zip.old" FROM waybills'
+            "), "
+            '"clean.waybill" AS ('
+            ' SELECT "zip.old" AS postcode FROM "raw.waybill"'
+            ' WHERE "zip.old" LIKE \'10%\''
+            ') SELECT postcode FROM "clean.waybill" WHERE postcode <> \'\''
+        ),
+    })
+    assert chain_sets(result, "m", "postcode") == {
+        ("m.postcode", 'm."clean.waybill".postcode',
+         'm."raw.waybill"."zip.old"', "waybills.receiver_zip_old"),
+    }
+    scopes = {c["scope"] for c in result["m"]["filter_conditions"]}
+    assert scopes == {m_scope for m_scope in {'m."clean.waybill"', "m"}}
+    condition_columns = {
+        c["column"] for c in result["m"]["filter_conditions"]}
+    assert '"zip.old"' in condition_columns
+
+
+def test_dotted_source_table_name_quoted_in_chain():
+    sources = {
+        "carrier.postcode": ["waybill_id", "receiver_zip_old", "city_id"],
+    }
+    result = analyze(
+        {"m": 'SELECT receiver_zip_old AS zip FROM "carrier.postcode"'},
+        targets=[("carrier.postcode", "receiver_zip_old")],
+        sources=sources,
+    )
+    assert chain_sets(result, "m", "zip") == {
+        ("m.zip", '"carrier.postcode".receiver_zip_old'),
+    }
+
+
+def test_embedded_quote_escaped_when_rendering():
+    sources = {"waybills": ['zip"old', "waybill_id"]}
+    result = analyze(
+        {"m": 'SELECT "zip""old" AS z FROM waybills'},
+        targets=[("waybills", 'zip"old')],
+        sources=sources,
+    )
+    assert chain_sets(result, "m", "z") == {
+        ("m.z", 'waybills."zip""old"'),
+    }
+
+
+def test_chains_via_different_models_and_scopes_all_kept():
+    result = analyze({
+        "a_model": "SELECT waybill_id, receiver_zip_old AS zip FROM waybills",
+        "b_model": "SELECT waybill_id, receiver_zip_old AS zip FROM waybills",
+        "m": (
+            "WITH c1 AS ("
+            " SELECT waybill_id, zip FROM a_model WHERE zip IS NOT NULL"
+            "), c2 AS ("
+            " SELECT waybill_id, zip FROM b_model WHERE zip IS NOT NULL"
+            ") SELECT COALESCE(c1.zip, c2.zip) AS z"
+            " FROM c1 JOIN c2 USING (waybill_id)"
+        ),
+    })
+    assert chain_sets(result, "m", "z") == {
+        ("m.z", "m.c1.zip", "a_model.zip", "waybills.receiver_zip_old"),
+        ("m.z", "m.c2.zip", "b_model.zip", "waybills.receiver_zip_old"),
+    }
+    # identical condition text in two scopes is reported once per scope
+    conditions = result["m"]["filter_conditions"]
+    scopes = {c["scope"] for c in conditions}
+    assert scopes == {"m.c1", "m.c2"}
+    assert len(conditions) == 2
+
+
+def test_normal_names_render_without_quotes():
+    result = analyze({"m": "SELECT receiver_zip_old AS zip FROM waybills"})
+    chain = result["m"]["dependent_output_columns"][0]["reference_chains"][0]
+    assert chain == ["m.zip", "waybills.receiver_zip_old"]
+    assert '"' not in "".join(chain)
+
+
+def test_dotted_model_inner_cte_scope_and_qualified_star():
+    result = analyze({
+        "carrier.postcode": (
+            "WITH cleaned AS ("
+            " SELECT receiver_zip_old AS zip FROM waybills"
+            " WHERE receiver_zip_old IS NOT NULL"
+            ") SELECT zip FROM cleaned WHERE zip <> ''"
+        ),
+        "m": 'SELECT p.* FROM "carrier.postcode" p',
+    })
+    assert chain_sets(result, "carrier.postcode", "zip") == {
+        ('"carrier.postcode".zip', '"carrier.postcode".cleaned.zip',
+         "waybills.receiver_zip_old"),
+    }
+    scopes = {c["scope"] for c in
+              result["carrier.postcode"]["filter_conditions"]}
+    assert scopes == {'"carrier.postcode".cleaned', '"carrier.postcode"'}
+    assert chain_sets(result, "m", "zip") == {
+        ("m.zip", '"carrier.postcode".zip', '"carrier.postcode".cleaned.zip',
+         "waybills.receiver_zip_old"),
+    }
+
+
+def test_dotted_star_exclude_matches_column_name():
+    result = analyze({
+        "carrier.postcode": (
+            'SELECT waybill_id, receiver_zip_old AS "zip.old" FROM waybills'),
+        "m": 'SELECT p.* EXCLUDE ("zip.old") FROM "carrier.postcode" p',
+    })
+    assert result["m"]["dependent_output_columns"] == []
